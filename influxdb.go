@@ -11,12 +11,13 @@ import (
 )
 
 type reporter struct {
-	reg       metrics.Registry
-	interval  time.Duration
-	align     bool
-	url       uurl.URL
-	database  string
-	unsafeSsl bool
+	reg          metrics.Registry
+	interval     time.Duration
+	align        bool
+	url          uurl.URL
+	database     string
+	unsafeSsl    bool
+	maxBatchSize int
 
 	measurement string
 	username    string
@@ -27,12 +28,12 @@ type reporter struct {
 }
 
 // InfluxDB starts a InfluxDB reporter which will post the metrics from the given registry at each d interval.
-func InfluxDB(r metrics.Registry, d time.Duration, url, database, measurement, username, password string, align bool, unsafeSsl bool) {
-	InfluxDBWithTags(r, d, url, database, measurement, username, password, map[string]string{}, align, unsafeSsl)
+func InfluxDB(r metrics.Registry, d time.Duration, url, database, measurement, username, password string, align bool, unsafeSsl bool, maxBatchSize int) {
+	InfluxDBWithTags(r, d, url, database, measurement, username, password, map[string]string{}, align, unsafeSsl, maxBatchSize)
 }
 
 // InfluxDBWithTags starts a InfluxDB reporter which will post the metrics from the given registry at each d interval with the specified tags
-func InfluxDBWithTags(r metrics.Registry, d time.Duration, url, database, measurement, username, password string, tags map[string]string, align bool, unsafeSsl bool) {
+func InfluxDBWithTags(r metrics.Registry, d time.Duration, url, database, measurement, username, password string, tags map[string]string, align bool, unsafeSsl bool, maxBatchSize int) {
 	u, err := uurl.Parse(url)
 	if err != nil {
 		log.Printf("unable to parse InfluxDB url %s. err=%v", url, err)
@@ -40,16 +41,17 @@ func InfluxDBWithTags(r metrics.Registry, d time.Duration, url, database, measur
 	}
 
 	rep := &reporter{
-		reg:         r,
-		interval:    d,
-		url:         *u,
-		database:    database,
-		measurement: measurement,
-		username:    username,
-		password:    password,
-		tags:        tags,
-		align:       align,
-		unsafeSsl:   unsafeSsl,
+		reg:          r,
+		interval:     d,
+		url:          *u,
+		database:     database,
+		measurement:  measurement,
+		username:     username,
+		password:     password,
+		tags:         tags,
+		align:        align,
+		unsafeSsl:    unsafeSsl,
+		maxBatchSize: maxBatchSize,
 	}
 	if err := rep.makeClient(); err != nil {
 		log.Printf("unable to make InfluxDB client. err=%v", err)
@@ -135,7 +137,7 @@ func (r *reporter) send() error {
 			})
 		case metrics.Histogram:
 			ms := metric.Snapshot()
-			ps := ms.Percentiles([]float64{0.5, 0.75, 0.95, 0.99, 0.999, 0.9999})
+			ps := ms.Percentiles([]float64{0.5, 0.75, 0.95, 0.99})
 			fields := map[string]float64{
 				"count":    float64(ms.Count()),
 				"max":      float64(ms.Max()),
@@ -147,8 +149,6 @@ func (r *reporter) send() error {
 				"p75":      ps[1],
 				"p95":      ps[2],
 				"p99":      ps[3],
-				"p999":     ps[4],
-				"p9999":    ps[5],
 			}
 			for k, v := range fields {
 				pts = append(pts, client.Point{
@@ -167,7 +167,6 @@ func (r *reporter) send() error {
 				"count": float64(ms.Count()),
 				"m1":    ms.Rate1(),
 				"m5":    ms.Rate5(),
-				"m15":   ms.Rate15(),
 				"mean":  ms.RateMean(),
 			}
 			for k, v := range fields {
@@ -183,7 +182,7 @@ func (r *reporter) send() error {
 
 		case metrics.Timer:
 			ms := metric.Snapshot()
-			ps := ms.Percentiles([]float64{0.5, 0.75, 0.95, 0.99, 0.999, 0.9999})
+			ps := ms.Percentiles([]float64{0.5, 0.75, 0.95, 0.99})
 			fields := map[string]float64{
 				"count":    float64(ms.Count()),
 				"max":      float64(ms.Max()),
@@ -195,11 +194,8 @@ func (r *reporter) send() error {
 				"p75":      ps[1],
 				"p95":      ps[2],
 				"p99":      ps[3],
-				"p999":     ps[4],
-				"p9999":    ps[5],
 				"m1":       ms.Rate1(),
 				"m5":       ms.Rate5(),
-				"m15":      ms.Rate15(),
 				"meanrate": ms.RateMean(),
 			}
 			for k, v := range fields {
@@ -215,13 +211,27 @@ func (r *reporter) send() error {
 		}
 	})
 
-	bps := client.BatchPoints{
-		Points:   pts,
-		Database: r.database,
+	maxBatchSize := r.maxBatchSize
+	if maxBatchSize <= 0 {
+		maxBatchSize = len(pts)
 	}
 
-	_, err := r.client.Write(bps)
-	return err
+	for i := 0; i < len(pts); i += maxBatchSize {
+		batchEnd := i + maxBatchSize
+		if len(pts) < batchEnd {
+			batchEnd = len(pts)
+		}
+		bps := client.BatchPoints{
+			Points:   pts[i:batchEnd],
+			Database: r.database,
+		}
+		_, err := r.client.Write(bps)
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 func bucketTags(bucket string, tags map[string]string) map[string]string {
